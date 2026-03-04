@@ -1,0 +1,332 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: security-scan
+    image: alpine:latest
+    command:
+    - cat
+    tty: true
+    volumeMounts:
+    - mountPath: /home/jenkins/agent/.snyk
+      name: snyk-cache
+      readOnly: false
+'''
+        }
+    }
+    
+    parameters {
+        choice(name: 'SCAN_TYPE', choices: ['code', 'dependency', 'container', 'all'], description: 'Type of security scan to run')
+        string(name: 'TARGET_REPO', defaultValue: 'normalyze/jenkins-test', description: 'Repository to scan')
+        string(name: 'TARGET_BRANCH', defaultValue: 'main', description: 'Branch to scan')
+        booleanParam(name: 'FAIL_ON_HIGH_VULNS', defaultValue: true, description: 'Fail pipeline on high severity vulnerabilities')
+        booleanParam(name: 'GENERATE_REPORT', defaultValue: true, description: 'Generate detailed security report')
+        string(name: 'SEVERITY_THRESHOLD', defaultValue: 'medium', description: 'Minimum severity to report: low, medium, high, critical')
+    }
+    
+    environment {
+        GITHUB_CREDENTIALS_ID = 'github-app-normalyze'
+        SNYK_TOKEN_CREDENTIALS_ID = 'snyk-token'
+        SCAN_REPORTS_DIR = 'security-reports'
+        SNYK_CACHE_DIR = '/home/jenkins/agent/.snyk'
+    }
+    
+    stages {
+        stage('Preparation') {
+            steps {
+                script {
+                    echo "🔒 Starting security scan pipeline"
+                    echo "Scan type: ${params.SCAN_TYPE}"
+                    echo "Target repository: ${params.TARGET_REPO}"
+                    echo "Target branch: ${params.TARGET_BRANCH}"
+                    echo "Severity threshold: ${params.SEVERITY_THRESHOLD}"
+                    echo "Fail on high vulns: ${params.FAIL_ON_HIGH_VULNS}"
+                    
+                    // Create reports directory
+                    sh '''
+                        mkdir -p ${SCAN_REPORTS_DIR}
+                        mkdir -p ${SNYK_CACHE_DIR}
+                    '''
+                }
+            }
+        }
+        
+        stage('Checkout') {
+            steps {
+                script {
+                    echo "📥 Checking out repository ${params.TARGET_REPO}..."
+                    
+                    // Clone the target repository
+                    sh '''
+                        git clone https://github.com/${params.TARGET_REPO}.git target-repo
+                        cd target-repo
+                        git checkout ${params.TARGET_BRANCH}
+                        echo "Current commit: $(git rev-parse HEAD)"
+                        echo "Repository size: $(du -sh .)"
+                    '''
+                }
+            }
+        }
+        
+        stage('Install Snyk') {
+            steps {
+                script {
+                    echo "📦 Installing Snyk CLI..."
+                    sh '''
+                        curl -o /usr/local/bin/snyk -L https://github.com/snyk/cli/releases/download/v1.1296.2/snyk-alpine
+                        chmod +x /usr/local/bin/snyk
+                        snyk --version
+                        
+                        # Authenticate with Snyk
+                        echo "Authenticating with Snyk..."
+                        SNYK_TOKEN=$(cat ~/.snyk-token)
+                        snyk auth $SNYK_TOKEN
+                    '''
+                }
+            }
+        }
+        
+        stage('Code Scan') {
+            when {
+                anyOf {
+                    expression { params.SCAN_TYPE == 'code' }
+                    expression { params.SCAN_TYPE == 'all' }
+                }
+            }
+            steps {
+                script {
+                    echo "🔍 Running code security scan..."
+                    sh '''
+                        cd target-repo
+                        
+                        echo "Scanning code for vulnerabilities..."
+                        snyk code --json > ../${SCAN_REPORTS_DIR}/code-scan.json 2>&1 || true
+                        
+                        echo "Generating code scan report..."
+                        snyk code --sarif > ../${SCAN_REPORTS_DIR}/code-scan.sarif 2>&1 || true
+                        
+                        echo "Code scan completed"
+                    '''
+                    
+                    // Parse and display results
+                    script {
+                        def codeResults = readJSON file: "${env.SCAN_REPORTS_DIR}/code-scan.json"
+                        if (codeResults && codeResults.vulnerabilities) {
+                            echo "📊 Code Scan Results:"
+                            echo "Total vulnerabilities: ${codeResults.vulnerabilities.size()}"
+                            
+                            def highVulns = codeResults.vulnerabilities.findAll { it.severity == 'high' }
+                            def mediumVulns = codeResults.vulnerabilities.findAll { it.severity == 'medium' }
+                            def lowVulns = codeResults.vulnerabilities.findAll { it.severity == 'low' }
+                            
+                            echo "High: ${highVulns.size()}, Medium: ${mediumVulns.size()}, Low: ${lowVulns.size()}"
+                            
+                            if (params.FAIL_ON_HIGH_VULNS && highVulns.size() > 0) {
+                                error("❌ High severity vulnerabilities found: ${highVulns.size()}")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Dependency Scan') {
+            when {
+                anyOf {
+                    expression { params.SCAN_TYPE == 'dependency' }
+                    expression { params.SCAN_TYPE == 'all' }
+                }
+            }
+            steps {
+                script {
+                    echo "📦 Running dependency security scan..."
+                    sh '''
+                        cd target-repo
+                        
+                        echo "Scanning dependencies for vulnerabilities..."
+                        snyk test --json > ../${SCAN_REPORTS_DIR}/dependency-scan.json 2>&1 || true
+                        
+                        echo "Generating dependency scan report..."
+                        snyk test --sarif > ../${SCAN_REPORTS_DIR}/dependency-scan.sarif 2>&1 || true
+                        
+                        echo "Dependency scan completed"
+                    '''
+                    
+                    // Parse and display results
+                    script {
+                        def depResults = readJSON file: "${env.SCAN_REPORTS_DIR}/dependency-scan.json"
+                        if (depResults && depResults.vulnerabilities) {
+                            echo "📊 Dependency Scan Results:"
+                            echo "Total vulnerabilities: ${depResults.vulnerabilities.size()}"
+                            
+                            def highVulns = depResults.vulnerabilities.findAll { it.severity == 'high' }
+                            def mediumVulns = depResults.vulnerabilities.findAll { it.severity == 'medium' }
+                            def lowVulns = depResults.vulnerabilities.findAll { it.severity == 'low' }
+                            
+                            echo "High: ${highVulns.size()}, Medium: ${mediumVulns.size()}, Low: ${lowVulns.size()}"
+                            
+                            if (params.FAIL_ON_HIGH_VULNS && highVulns.size() > 0) {
+                                error("❌ High severity vulnerabilities found: ${highVulns.size()}")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Container Scan') {
+            when {
+                anyOf {
+                    expression { params.SCAN_TYPE == 'container' }
+                    expression { params.SCAN_TYPE == 'all' }
+                }
+            }
+            steps {
+                script {
+                    echo "🐳 Running container security scan..."
+                    
+                    // Check if Dockerfile exists
+                    def dockerfileExists = fileExists('target-repo/Dockerfile')
+                    if (!dockerfileExists) {
+                        echo "⚠️ No Dockerfile found, skipping container scan"
+                        return
+                    }
+                    
+                    sh '''
+                        cd target-repo
+                        
+                        echo "Building container image for scanning..."
+                        docker build -t security-scan-temp .
+                        
+                        echo "Scanning container image for vulnerabilities..."
+                        snyk container --json security-scan-temp > ../${SCAN_REPORTS_DIR}/container-scan.json 2>&1 || true
+                        
+                        echo "Generating container scan report..."
+                        snyk container --sarif security-scan-temp > ../${SCAN_REPORTS_DIR}/container-scan.sarif 2>&1 || true
+                        
+                        echo "Cleaning up temporary image..."
+                        docker rmi security-scan-temp
+                        
+                        echo "Container scan completed"
+                    '''
+                    
+                    // Parse and display results
+                    script {
+                        def containerResults = readJSON file: "${env.SCAN_REPORTS_DIR}/container-scan.json"
+                        if (containerResults && containerResults.vulnerabilities) {
+                            echo "📊 Container Scan Results:"
+                            echo "Total vulnerabilities: ${containerResults.vulnerabilities.size()}"
+                            
+                            def highVulns = containerResults.vulnerabilities.findAll { it.severity == 'high' }
+                            def mediumVulns = containerResults.vulnerabilities.findAll { it.severity == 'medium' }
+                            def lowVulns = containerResults.vulnerabilities.findAll { it.severity == 'low' }
+                            
+                            echo "High: ${highVulns.size()}, Medium: ${mediumVulns.size()}, Low: ${lowVulns.size()}"
+                            
+                            if (params.FAIL_ON_HIGH_VULNS && highVulns.size() > 0) {
+                                error("❌ High severity vulnerabilities found: ${highVulns.size()}")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Generate Report') {
+            when {
+                expression { params.GENERATE_REPORT }
+            }
+            steps {
+                script {
+                    echo "📋 Generating comprehensive security report..."
+                    sh '''
+                        echo "🔒 Security Scan Report" > ${SCAN_REPORTS_DIR}/security-summary.txt
+                        echo "==========================" >> ${SCAN_REPORTS_DIR}/security-summary.txt
+                        echo "" >> ${SCAN_REPORTS_DIR}/security-summary.txt
+                        echo "Repository: ${params.TARGET_REPO}" >> ${SCAN_REPORTS_DIR}/security-summary.txt
+                        echo "Branch: ${params.TARGET_BRANCH}" >> ${SCAN_REPORTS_DIR}/security-summary.txt
+                        echo "Scan Type: ${params.SCAN_TYPE}" >> ${SCAN_REPORTS_DIR}/security-summary.txt
+                        echo "Timestamp: $(date)" >> ${SCAN_REPORTS_DIR}/security-summary.txt
+                        echo "" >> ${SCAN_REPORTS_DIR}/security-summary.txt
+                        
+                        # Add scan results summary
+                        for scan_type in code dependency container; do
+                            if [ -f "${SCAN_REPORTS_DIR}/${scan_type}-scan.json" ]; then
+                                echo "--- ${scan_type^} Scan ---" >> ${SCAN_REPORTS_DIR}/security-summary.txt
+                                # Parse JSON and add summary
+                                python3 -c "
+import json
+with open('${SCAN_REPORTS_DIR}/${scan_type}-scan.json', 'r') as f:
+    data = json.load(f)
+if 'vulnerabilities' in data:
+    vulns = data['vulnerabilities']
+    high = len([v for v in vulns if v.get('severity') == 'high'])
+    medium = len([v for v in vulns if v.get('severity') == 'medium'])
+    low = len([v for v in vulns if v.get('severity') == 'low'])
+    print(f'Total: {len(vulns)}, High: {high}, Medium: {medium}, Low: {low}')
+else:
+    print('No vulnerabilities found')
+" >> ${SCAN_REPORTS_DIR}/security-summary.txt
+                                echo "" >> ${SCAN_REPORTS_DIR}/security-summary.txt
+                            fi
+                        done
+                        
+                        echo "Report generated successfully"
+                    '''
+                    
+                    // Archive all reports
+                    archiveArtifacts artifacts: "${env.SCAN_REPORTS_DIR}/**/*"
+                    
+                    // Display summary
+                    sh '''
+                        cat ${SCAN_REPORTS_DIR}/security-summary.txt
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                echo "🔒 Security scan pipeline completed"
+                echo "Repository: ${params.TARGET_REPO}"
+                echo "Branch: ${params.TARGET_BRANCH}"
+                echo "Scan type: ${params.SCAN_TYPE}"
+                
+                // Clean up
+                sh '''
+                    rm -rf target-repo
+                    echo "Cleaned up workspace"
+                '''
+            }
+        }
+        success {
+            script {
+                echo "✅ Security scan completed successfully"
+                
+                // Send success notification
+                sh '''
+                    echo "🔒 Security scan completed for ${params.TARGET_REPO}"
+                    echo "Scan type: ${params.SCAN_TYPE}"
+                    echo "Branch: ${params.TARGET_BRANCH}"
+                '''
+            }
+        }
+        failure {
+            script {
+                echo "❌ Security scan failed"
+                
+                // Send failure notification
+                sh '''
+                    echo "❌ Security scan failed for ${params.TARGET_REPO}"
+                    echo "Check the reports for details"
+                '''
+            }
+        }
+    }
+}

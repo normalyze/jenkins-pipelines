@@ -1,0 +1,78 @@
+# Jenkins Pipelines Repository
+
+# Build artifacts
+build-artifacts/
+test-results/
+security-reports/
+target-repo/
+
+# Jenkins workspace files
+*.log
+*.tmp
+*.bak
+
+# Security scan reports
+security-scan.json
+security-scan.sarif
+*.snyk
+
+# Docker artifacts
+docker-compose.override.yml
+.dockerignore
+
+# Temporary files
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node.js (if any)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Python (if any)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Terraform (if any)
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# Kubernetes (if any)
+*.kubeconfig
+kubeconfig*
+
+# AWS credentials (if any)
+.aws/
+aws-credentials.json
+
+# Snyk (if any)
+.snyk
+snyk-*.json
+
+# Jenkins specific
+Jenkinsfile.backup
+*.jenkins
+
+# Release artifacts
+release-notes.md
+*.tar.gz
+*.zip

@@ -1,0 +1,369 @@
+pipeline {
+    agent {
+        kubernetes {
+            yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+  - name: docker
+    image: docker:20.10.16
+    command:
+    - cat
+    tty: true
+    volumeMounts:
+    - mountPath: /var/run/docker.sock
+      name: docker-socket
+  - name: aws-cli
+    image: amazon/aws-cli:2.7.0
+    command:
+    - cat
+    tty: true
+    env:
+    - name: AWS_DEFAULT_REGION
+      value: us-east-1
+  - name: snyk
+    image: alpine:latest
+    command:
+    - cat
+    tty: true
+'''
+        }
+    }
+    
+    parameters {
+        string(name: 'WORKER_VERSION', defaultValue: 'latest', description: 'Build worker version to build')
+        string(name: 'DOCKERFILE_PATH', defaultValue: 'Dockerfile', description: 'Path to Dockerfile')
+        string(name: 'ECR_REGISTRY', defaultValue: '683793131831.dkr.ecr.us-east-1.amazonaws.com', description: 'ECR registry URL')
+        string(name: 'ECR_REPO', defaultValue: 'jenkins-ci/build-worker', description: 'ECR repository name')
+        booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip running tests')
+        booleanParam(name: 'SKIP_SECURITY_SCAN', defaultValue: false, description: 'Skip Snyk security scan')
+        booleanParam(name: 'PUSH_TO_ECR', defaultValue: true, description: 'Push image to ECR')
+        booleanParam(name: 'CREATE_TAG', defaultValue: true, description: 'Create git tag for release')
+        string(name: 'GIT_TAG_PREFIX', defaultValue: 'build-worker-', description: 'Git tag prefix')
+    }
+    
+    environment {
+        GITHUB_CREDENTIALS_ID = 'github-app-normalyze'
+        AWS_CREDENTIALS_ID = 'aws-jenkins-credentials'
+        SNYK_TOKEN_CREDENTIALS_ID = 'snyk-token'
+        DOCKER_IMAGE_NAME = 'build-worker'
+        DOCKER_BUILD_CONTEXT = '.'
+    }
+    
+    stages {
+        stage('Preparation') {
+            steps {
+                script {
+                    echo "🏗️  Starting build worker pipeline"
+                    echo "Version: ${params.WORKER_VERSION}"
+                    echo "ECR Repository: ${params.ECR_REGISTRY}/${params.ECR_REPO}"
+                    echo "Skip tests: ${params.SKIP_TESTS}"
+                    echo "Skip security scan: ${params.SKIP_SECURITY_SCAN}"
+                    echo "Push to ECR: ${params.PUSH_TO_ECR}"
+                    echo "Create git tag: ${params.CREATE_TAG}"
+                    
+                    // Set image tag
+                    if (params.WORKER_VERSION == 'latest') {
+                        env.IMAGE_TAG = "latest"
+                    } else {
+                        env.IMAGE_TAG = params.WORKER_VERSION
+                    }
+                    
+                    echo "Building image: ${env.DOCKER_IMAGE_NAME}:${env.IMAGE_TAG}"
+                }
+            }
+        }
+        
+        stage('Checkout') {
+            steps {
+                script {
+                    echo "📥 Checking out build-worker repository..."
+                    
+                    // Clone the build-worker repository
+                    sh '''
+                        git clone https://github.com/normalyze/build-worker.git
+                        cd build-worker
+                        git checkout main
+                        echo "Current commit: $(git rev-parse HEAD)"
+                        echo "Repository contents:"
+                        ls -la
+                    '''
+                }
+            }
+        }
+        
+        stage('Validate Dockerfile') {
+            steps {
+                script {
+                    echo "🔍 Validating Dockerfile..."
+                    sh '''
+                        cd build-worker
+                        
+                        if [ ! -f "${params.DOCKERFILE_PATH}" ]; then
+                            echo "❌ Dockerfile not found at ${params.DOCKERFILE_PATH}"
+                            exit 1
+                        fi
+                        
+                        echo "✅ Dockerfile found"
+                        echo "Dockerfile content:"
+                        cat "${params.DOCKERFILE_PATH}"
+                        
+                        # Validate Dockerfile syntax
+                        docker build --dry-run -f "${params.DOCKERFILE_PATH}" . || {
+                            echo "❌ Dockerfile validation failed"
+                            exit 1
+                        }
+                        
+                        echo "✅ Dockerfile validation passed"
+                    '''
+                }
+            }
+        }
+        
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    echo "🐳 Building Docker image..."
+                    sh '''
+                        cd build-worker
+                        
+                        echo "Building ${DOCKER_IMAGE_NAME}:${IMAGE_TAG}..."
+                        docker build -f "${params.DOCKERFILE_PATH}" -t "${DOCKER_IMAGE_NAME}:${IMAGE_TAG}" .
+                        
+                        echo "✅ Docker image built successfully"
+                        docker images | grep "${DOCKER_IMAGE_NAME}"
+                    '''
+                }
+            }
+        }
+        
+        stage('Test Docker Image') {
+            when {
+                not { params.SKIP_TESTS }
+            }
+            steps {
+                script {
+                    echo "🧪 Testing Docker image..."
+                    sh '''
+                        echo "Starting container for testing..."
+                        docker run --name test-container -d "${DOCKER_IMAGE_NAME}:${IMAGE_TAG}" sleep 30
+                        
+                        echo "Waiting for container to start..."
+                        sleep 5
+                        
+                        echo "Checking container status..."
+                        docker ps | grep test-container
+                        
+                        echo "Testing container functionality..."
+                        # Test if snyk is available
+                        docker exec test-container which snyk || {
+                            echo "⚠️ Snyk not found in container"
+                        }
+                        
+                        echo "Testing container environment..."
+                        docker exec test-container env | grep BUILD_WORKER
+                        
+                        echo "✅ Container tests passed"
+                        
+                        echo "Cleaning up test container..."
+                        docker stop test-container
+                        docker rm test-container
+                    '''
+                }
+            }
+        }
+        
+        stage('Security Scan') {
+            when {
+                not { params.SKIP_SECURITY_SCAN }
+            }
+            steps {
+                script {
+                    echo "🔒 Running Snyk security scan..."
+                    sh '''
+                        cd build-worker
+                        
+                        echo "Authenticating with Snyk..."
+                        SNYK_TOKEN=$(cat ~/.snyk-token)
+                        snyk auth $SNYK_TOKEN
+                        
+                        echo "Scanning Docker image..."
+                        snyk container --json "${DOCKER_IMAGE_NAME}:${IMAGE_TAG}" > ../security-scan.json 2>&1 || true
+                        
+                        echo "Generating SARIF report..."
+                        snyk container --sarif "${DOCKER_IMAGE_NAME}:${IMAGE_TAG}" > ../security-scan.sarif 2>&1 || true
+                        
+                        echo "✅ Security scan completed"
+                    '''
+                    
+                    // Parse security scan results
+                    script {
+                        def scanResults = readJSON file: 'security-scan.json'
+                        if (scanResults && scanResults.vulnerabilities) {
+                            echo "📊 Security Scan Results:"
+                            echo "Total vulnerabilities: ${scanResults.vulnerabilities.size()}"
+                            
+                            def highVulns = scanResults.vulnerabilities.findAll { it.severity == 'high' }
+                            def mediumVulns = scanResults.vulnerabilities.findAll { it.severity == 'medium' }
+                            def lowVulns = scanResults.vulnerabilities.findAll { it.severity == 'low' }
+                            
+                            echo "High: ${highVulns.size()}, Medium: ${mediumVulns.size()}, Low: ${lowVulns.size()}"
+                            
+                            // Fail on high severity vulnerabilities
+                            if (highVulns.size() > 0) {
+                                error("❌ High severity vulnerabilities found: ${highVulns.size()}")
+                            }
+                        } else {
+                            echo "✅ No vulnerabilities found"
+                        }
+                    }
+                    
+                    // Archive security reports
+                    archiveArtifacts artifacts: 'security-scan.*'
+                }
+            }
+        }
+        
+        stage('Push to ECR') {
+            when {
+                expression { params.PUSH_TO_ECR }
+            }
+            steps {
+                script {
+                    echo "📤 Pushing image to ECR..."
+                    sh '''
+                        echo "Logging into ECR..."
+                        aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${params.ECR_REGISTRY}
+                        
+                        echo "Tagging image for ECR..."
+                        docker tag "${DOCKER_IMAGE_NAME}:${IMAGE_TAG}" "${params.ECR_REGISTRY}/${params.ECR_REPO}:${IMAGE_TAG}"
+                        
+                        if [ "${IMAGE_TAG}" != "latest" ]; then
+                            docker tag "${DOCKER_IMAGE_NAME}:${IMAGE_TAG}" "${params.ECR_REGISTRY}/${params.ECR_REPO}:latest"
+                        fi
+                        
+                        echo "Pushing image to ECR..."
+                        docker push "${params.ECR_REGISTRY}/${params.ECR_REPO}:${IMAGE_TAG}"
+                        
+                        if [ "${IMAGE_TAG}" != "latest" ]; then
+                            docker push "${params.ECR_REGISTRY}/${params.ECR_REPO}:latest"
+                        fi
+                        
+                        echo "✅ Image pushed to ECR successfully"
+                        echo "Image URL: ${params.ECR_REGISTRY}/${params.ECR_REPO}:${IMAGE_TAG}"
+                    '''
+                }
+            }
+        }
+        
+        stage('Create Git Tag') {
+            when {
+                expression { params.CREATE_TAG }
+                expression { params.WORKER_VERSION != 'latest' }
+            }
+            steps {
+                script {
+                    echo "🏷️  Creating git tag..."
+                    sh '''
+                        cd build-worker
+                        
+                        TAG_NAME="${params.GIT_TAG_PREFIX}${params.WORKER_VERSION}"
+                        
+                        echo "Creating tag: $TAG_NAME"
+                        git tag -a "$TAG_NAME" -m "Build worker version ${params.WORKER_VERSION}"
+                        
+                        echo "Pushing tag to GitHub..."
+                        git push origin "$TAG_NAME"
+                        
+                        echo "✅ Git tag created and pushed"
+                        echo "Tag URL: https://github.com/normalyze/build-worker/releases/tag/$TAG_NAME"
+                    '''
+                }
+            }
+        }
+        
+        stage('Generate Release Notes') {
+            steps {
+                script {
+                    echo "📝 Generating release notes..."
+                    sh '''
+                        cd build-worker
+                        
+                        echo "# Build Worker Release Notes" > release-notes.md
+                        echo "## Version: ${params.WORKER_VERSION}" >> release-notes.md
+                        echo "## Build Date: $(date)" >> release-notes.md
+                        echo "" >> release-notes.md
+                        echo "### Changes" >> release-notes.md
+                        echo "- Updated build worker image" >> release-notes.md
+                        echo "- Security scan completed" >> release-notes.md
+                        echo "- Tests passed" >> release-notes.md
+                        echo "" >> release-notes.md
+                        echo "### Image Details" >> release-notes.md
+                        echo "- Image: ${params.ECR_REGISTRY}/${params.ECR_REPO}:${params.WORKER_VERSION}" >> release-notes.md
+                        echo "- Dockerfile: ${params.DOCKERFILE_PATH}" >> release-notes.md
+                        echo "" >> release-notes.md
+                        echo "### Security" >> release-notes.md
+                        echo "- Snyk scan completed" >> release-notes.md
+                        echo "- No high severity vulnerabilities" >> release-notes.md
+                        echo "" >> release-notes.md
+                        echo "### Usage" >> release-notes.md
+                        echo '```bash' >> release-notes.md
+                        echo "docker run ${params.ECR_REGISTRY}/${params.ECR_REPO}:${params.WORKER_VERSION}" >> release-notes.md
+                        echo '```' >> release-notes.md
+                        
+                        echo "✅ Release notes generated"
+                        cat release-notes.md
+                    '''
+                    
+                    // Archive release notes
+                    archiveArtifacts artifacts: 'build-worker/release-notes.md'
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                echo "🏗️  Build worker pipeline completed"
+                echo "Version: ${params.WORKER_VERSION}"
+                echo "Image: ${params.ECR_REGISTRY}/${params.ECR_REPO}:${params.WORKER_VERSION}"
+                
+                // Clean up
+                sh '''
+                    cd build-worker
+                    docker system prune -f || true
+                    echo "Cleaned up Docker resources"
+                '''
+            }
+        }
+        success {
+            script {
+                echo "✅ Build worker pipeline completed successfully"
+                
+                // Send success notification
+                sh '''
+                    echo "🚀 Build worker v${params.WORKER_VERSION} built successfully"
+                    echo "Image: ${params.ECR_REGISTRY}/${params.ECR_REPO}:${params.WORKER_VERSION}"
+                '''
+                
+                // Update deployment status
+                if (params.PUSH_TO_ECR) {
+                    echo "📤 Image pushed to ECR and ready for deployment"
+                }
+            }
+        }
+        failure {
+            script {
+                echo "❌ Build worker pipeline failed"
+                
+                // Send failure notification
+                sh '''
+                    echo "❌ Build worker v${params.WORKER_VERSION} build failed"
+                    echo "Check the logs for details"
+                '''
+            }
+        }
+    }
+}

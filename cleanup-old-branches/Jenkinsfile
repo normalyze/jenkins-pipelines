@@ -1,0 +1,112 @@
+pipeline {
+    agent any
+    parameters {
+        string(name: 'ENVIRONMENT', defaultValue: 'dev', description: 'Target environment to cleanup')
+        booleanParam(name: 'DRY_RUN', defaultValue: false, description: 'Dry run - show what would be deleted')
+        string(name: 'OLDER_THAN_DAYS', defaultValue: '30', description: 'Delete branches older than X days')
+        booleanParam(name: 'DELETE_MERGED_BRANCHES', defaultValue: false, description: 'Delete already merged branches')
+    }
+    
+    environment {
+        GITHUB_CREDENTIALS_ID = 'github-app-normalyze'
+    }
+    
+    stages {
+        stage('Setup') {
+            steps {
+                script {
+                    echo "Setting up cleanup for ${params.ENVIRONMENT} environment"
+                    echo "Dry run: ${params.DRY_RUN}"
+                    echo "Delete branches older than ${params.OLDER_THAN_DAYS} days"
+                    echo "Delete merged branches: ${params.DELETE_MERGED_BRANCHES}"
+                }
+            }
+        }
+        
+        stage('List Branches') {
+            steps {
+                script {
+                    echo "Listing branches in repository..."
+                    sh '''
+                        git branch -a
+                    '''
+                }
+            }
+        }
+        
+        stage('Cleanup') {
+            steps {
+                script {
+                    echo "Starting cleanup process..."
+                    
+                    if (!params.DRY_RUN) {
+                        // Delete branches older than specified days
+                        sh '''
+                            git branch -r --merged | while read branch; do
+                                commit_date=$(git log -1 --format="%ci" "$branch")
+                                commit_timestamp=$(date -d "$commit_date" +%s)
+                                current_timestamp=$(date +%s)
+                                age_days=$(( (current_timestamp - commit_timestamp) / 86400))
+                                
+                                if [ $age_days -gt ${params.OLDER_THAN_DAYS} ]; then
+                                    echo "Deleting old branch: $branch (${age_days} days old)"
+                                    git branch -D "$branch"
+                                fi
+                            done
+                        '''
+                        
+                        // Delete merged branches if requested
+                        if (params.DELETE_MERGED_BRANCHES) {
+                            sh '''
+                                git branch --merged | while read branch; do
+                                    echo "Deleting merged branch: $branch"
+                                    git branch -D "$branch"
+                                done
+                            '''
+                        }
+                        
+                        // Clean up stale remote branches
+                        sh '''
+                            git remote prune origin
+                        '''
+                    } else {
+                        echo "DRY RUN - No actual deletions performed"
+                        sh '''
+                            git branch -r --merged | while read branch; do
+                                commit_date=$(git log -1 --format="%ci" "$branch")
+                                commit_timestamp=$(date -d "$commit_date" +%s)
+                                current_timestamp=$(date +%s)
+                                age_days=$(( (current_timestamp - commit_timestamp) / 86400))
+                                
+                                if [ $age_days -gt ${params.OLDER_THAN_DAYS} ]; then
+                                    echo "WOULD DELETE: $branch (${age_days} days old)"
+                                fi
+                            done
+                            
+                            if [ "${params.DELETE_MERGED_BRANCHES}" = "true" ]; then
+                                git branch --merged | while read branch; do
+                                    echo "WOULD DELETE: $branch (merged)"
+                                done
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                echo "Cleanup completed for ${params.ENVIRONMENT}"
+                echo "Total branches processed: $(git branch -a | wc -l)"
+            }
+        }
+        success {
+            echo "✅ Cleanup pipeline completed successfully"
+        }
+        failure {
+            echo "❌ Cleanup pipeline failed"
+        }
+    }
+}
