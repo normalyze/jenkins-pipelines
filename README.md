@@ -1,5 +1,14 @@
 # Jenkins Manual/UI Pipelines
 
+This repository contains standalone pipelines for Jenkins multibranch discovery.
+
+## Recent Update
+- Added main Jenkinsfile for multibranch pipeline discovery
+- Enables parameterized pipeline execution
+- Supports cleanup, deploy, security-scan, and build-worker operations
+
+# Jenkins Manual/UI Pipelines
+
 This repository contains standalone pipelines that can be:
 - **Edited directly in GitHub** via the web UI
 - **Automatically picked up by Jenkins** Multibranch Pipeline
